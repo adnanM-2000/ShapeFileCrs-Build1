@@ -1,0 +1,220 @@
+
+name: Build PROJ 9.9.0 Windows x64
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+
+  build-proj:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            mingw-w64 \
+            gcc-mingw-w64-x86-64-posix \
+            g++-mingw-w64-x86-64-posix \
+            binutils-mingw-w64-x86-64 \
+            sqlite3 \
+            unzip \
+            zip \
+            curl \
+            file
+
+      - name: Download PROJ 9.9.0
+        run: |
+          mkdir -p downloads
+          mkdir -p build
+          mkdir -p package
+
+          curl -fL \
+            https://download.osgeo.org/proj/proj-9.9.0.tar.gz \
+            -o downloads/proj-9.9.0.tar.gz
+
+          tar -xzf downloads/proj-9.9.0.tar.gz \
+            -C build
+
+      - name: Download SQLite amalgamation
+        run: |
+          curl -fL \
+            https://www.sqlite.org/2025/sqlite-amalgamation-3500400.zip \
+            -o downloads/sqlite.zip
+
+          mkdir -p build/sqlite
+
+          unzip -q downloads/sqlite.zip \
+            -d build/sqlite
+
+      - name: Build Windows SQLite
+        run: |
+          SQLITE_DIR=$(find build/sqlite \
+            -maxdepth 1 -type d \
+            -name 'sqlite-amalgamation-*' | head -1)
+
+          mkdir -p build/sqlite-win/include
+          mkdir -p build/sqlite-win/lib
+
+          cp "$SQLITE_DIR/sqlite3.h" \
+            build/sqlite-win/include/
+
+          cp "$SQLITE_DIR/sqlite3ext.h" \
+            build/sqlite-win/include/
+
+          x86_64-w64-mingw32-gcc-posix \
+            -O2 \
+            -DSQLITE_THREADSAFE=1 \
+            -DSQLITE_ENABLE_COLUMN_METADATA \
+            -DSQLITE_ENABLE_RTREE \
+            -c "$SQLITE_DIR/sqlite3.c" \
+            -o build/sqlite-win/sqlite3.o
+
+          x86_64-w64-mingw32-ar rcs \
+            build/sqlite-win/lib/libsqlite3.a \
+            build/sqlite-win/sqlite3.o
+
+      - name: Configure PROJ
+        run: |
+          mkdir -p build/proj-build
+
+          cmake -S build/proj-9.9.0 \
+            -B build/proj-build \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw64.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/proj-win \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc-posix \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++-posix \
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DBUILD_SHARED_LIBS=ON \
+            -DAPPEND_SOVERSION=OFF \
+            -DPROJ_OUTPUT_NAME=proj \
+            -DBUILD_APPS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_CURL=OFF \
+            -DENABLE_TIFF=OFF \
+            -DENABLE_IPO=OFF \
+            -DSQLite3_INCLUDE_DIR="$GITHUB_WORKSPACE/build/sqlite-win/include" \
+            -DSQLite3_LIBRARY="$GITHUB_WORKSPACE/build/sqlite-win/lib/libsqlite3.a" \
+            -DEXE_SQLITE3=/usr/bin/sqlite3 \
+            -DEMBED_PROJ_DATA_PATH=OFF
+
+      - name: Compile PROJ
+        run: |
+          cmake --build build/proj-build \
+            --parallel 2
+
+      - name: Install PROJ
+        run: |
+          DESTDIR="$GITHUB_WORKSPACE/staging" \
+            cmake --install build/proj-build
+
+      - name: Package Windows binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$GITHUB_WORKSPACE/staging/proj-win"
+          OUT="$GITHUB_WORKSPACE/package/ShapeFileCrs-PROJ-Windows-x64"
+
+          mkdir -p "$OUT/Data"
+
+          PROJ_DLL=$(find "$ROOT" \
+            -type f -iname 'proj.dll' | head -1)
+
+          PROJ_DB=$(find "$ROOT" \
+            -type f -name 'proj.db' | head -1)
+
+          if [ -z "$PROJ_DLL" ] || [ -z "$PROJ_DB" ]; then
+            echo "PROJ DLL or database missing"
+            exit 1
+          fi
+
+          cp "$PROJ_DLL" "$OUT/proj.dll"
+          cp "$PROJ_DB" "$OUT/Data/proj.db"
+
+          PROJ_INI=$(find "$ROOT" \
+            -type f -name 'proj.ini' | head -1 || true)
+
+          if [ -n "$PROJ_INI" ]; then
+            cp "$PROJ_INI" "$OUT/Data/proj.ini"
+          fi
+
+          # Copy MinGW runtime dependencies.
+          CXX=x86_64-w64-mingw32-g++-posix
+
+          for DLL in \
+            libstdc++-6.dll \
+            libgcc_s_seh-1.dll \
+            libwinpthread-1.dll
+          do
+            PATH_DLL=$($CXX -print-file-name="$DLL")
+
+            if [ -f "$PATH_DLL" ]; then
+              cp "$PATH_DLL" "$OUT/"
+            fi
+          done
+
+          echo "PROJ DLL dependencies:"
+          x86_64-w64-mingw32-objdump \
+            -p "$OUT/proj.dll" | grep "DLL Name:" || true
+
+          echo "PE architecture:"
+          file "$OUT/proj.dll"
+
+          echo "SQLite database integrity:"
+          sqlite3 "$OUT/Data/proj.db" \
+            "PRAGMA integrity_check;"
+
+          cat > "$OUT/README.txt" <<'EOF'
+          PROJ 9.9.0 - Windows x64
+          Built using MinGW-w64 on Ubuntu 24.04.
+
+          Contents:
+          - proj.dll
+          - MinGW runtime dependencies
+          - Data/proj.db
+
+          No GDAL required.
+          No datum transformation grids included.
+
+          Set PROJ_DATA to the Data directory
+          before initializing PROJ.
+
+          Target:
+          Windows x64
+          VB.NET / .NET 6.0
+          EOF
+
+          cd "$GITHUB_WORKSPACE/package"
+
+          zip -r \
+            ShapeFileCrs-PROJ-Windows-x64.zip \
+            ShapeFileCrs-PROJ-Windows-x64
+
+      - name: Upload Windows x64 package
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: ShapeFileCrs-PROJ-Windows-x64
+          path: package/ShapeFileCrs-PROJ-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
